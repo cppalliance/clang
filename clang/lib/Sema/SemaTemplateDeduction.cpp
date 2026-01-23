@@ -6157,11 +6157,11 @@ FunctionDecl *Sema::getMoreConstrainedFunction(FunctionDecl *FD1,
          (isa<CXXConversionDecl, CXXConstructorDecl>(FD2)));
 
   FunctionDecl *F1 = FD1;
-  if (FunctionDecl *P = FD1->getTemplateInstantiationPattern(false))
+  while (FunctionDecl *P = F1->getTemplateInstantiationPattern(false))
     F1 = P;
 
   FunctionDecl *F2 = FD2;
-  if (FunctionDecl *P = FD2->getTemplateInstantiationPattern(false))
+  while (FunctionDecl *P = F2->getTemplateInstantiationPattern(false))
     F2 = P;
 
   llvm::SmallVector<AssociatedConstraint, 1> AC1, AC2;
