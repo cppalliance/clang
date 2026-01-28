@@ -1147,8 +1147,9 @@ void Parser::AnnotateExistingDecltypeSpecifier(const DeclSpec &DS,
 }
 
 SourceLocation Parser::ParsePackIndexingType(DeclSpec &DS) {
-  assert(Tok.isOneOf(tok::annot_pack_indexing_type, tok::identifier) &&
-         "Expected an identifier");
+  assert(Tok.isOneOf(tok::annot_pack_indexing_type, tok::identifier,
+                     tok::annot_template_id) &&
+         "Expected an identifier or template-id");
 
   TypeResult Type;
   SourceLocation StartLoc;
@@ -1180,15 +1181,41 @@ SourceLocation Parser::ParsePackIndexingType(DeclSpec &DS) {
     return Tok.getEndLoc();
   }
 
-  ParsedType Ty = Actions.getTypeName(*Tok.getIdentifierInfo(),
-                                      Tok.getLocation(), getCurScope());
-  if (!Ty) {
-    DS.SetTypeSpecError();
-    return Tok.getEndLoc();
-  }
-  Type = Ty;
+  if (Tok.is(tok::annot_template_id)) {
+    TemplateIdAnnotation *TemplateId = takeTemplateIdAnnotation(Tok);
+    StartLoc = TemplateId->TemplateNameLoc;
 
-  StartLoc = ConsumeToken();
+    ASTTemplateArgsPtr TemplateArgsPtr(TemplateId->getTemplateArgs(),
+                                       TemplateId->NumArgs);
+    CXXScopeSpec SS;
+    TypeResult Ty =
+        TemplateId->isInvalid()
+            ? TypeError()
+            : Actions.ActOnTemplateIdType(
+                  getCurScope(), ElaboratedTypeKeyword::None,
+                  /*ElaboratedKeywordLoc=*/SourceLocation(), SS,
+                  TemplateId->TemplateKWLoc, TemplateId->Template,
+                  TemplateId->Name, TemplateId->TemplateNameLoc,
+                  TemplateId->LAngleLoc, TemplateArgsPtr, TemplateId->RAngleLoc,
+                  /*IsCtorOrDtorName=*/false, /*IsClassName=*/false,
+                  ImplicitTypenameContext::No);
+
+    if (Ty.isInvalid()) {
+      DS.SetTypeSpecError();
+      return TemplateId->RAngleLoc;
+    }
+    Type = Ty;
+    ConsumeAnnotationToken();
+  } else {
+    ParsedType Ty = Actions.getTypeName(*Tok.getIdentifierInfo(),
+                                        Tok.getLocation(), getCurScope());
+    if (!Ty) {
+      DS.SetTypeSpecError();
+      return Tok.getEndLoc();
+    }
+    Type = Ty;
+    StartLoc = ConsumeToken();
+  }
   EllipsisLoc = ConsumeToken();
   BalancedDelimiterTracker T(*this, tok::l_square);
   T.consumeOpen();

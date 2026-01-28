@@ -324,6 +324,37 @@ bool Parser::ParseOptionalCXXScopeSpecifier(
       continue;
     }
 
+    // Handle template-id pack-index-specifier
+    if (Tok.is(tok::annot_template_id) && NextToken().is(tok::ellipsis) &&
+        GetLookAheadToken(2).is(tok::l_square) &&
+        !GetLookAheadToken(3).is(tok::r_square)) {
+      SourceLocation Start = Tok.getLocation();
+      DeclSpec DS(AttrFactory);
+      SourceLocation CCLoc;
+      SourceLocation EndLoc = ParsePackIndexingType(DS);
+      if (DS.getTypeSpecType() == DeclSpec::TST_error)
+        return false;
+
+      QualType Pattern = Sema::GetTypeFromParser(DS.getRepAsType());
+      QualType Type =
+          Actions.ActOnPackIndexingType(Pattern, DS.getPackIndexingExpr(),
+                                        DS.getBeginLoc(), DS.getEllipsisLoc());
+
+      if (Type.isNull())
+        return false;
+
+      if (!TryConsumeToken(tok::coloncolon, CCLoc)) {
+        AnnotateExistingIndexedTypeNamePack(ParsedType::make(Type), Start,
+                                            EndLoc);
+        return false;
+      }
+      if (Actions.ActOnCXXNestedNameSpecifierIndexedPack(SS, DS, CCLoc,
+                                                         std::move(Type)))
+        SS.SetInvalid(SourceRange(Start, CCLoc));
+      HasScopeSpecifier = true;
+      continue;
+    }
+
     if (Tok.is(tok::annot_template_id) && NextToken().is(tok::coloncolon)) {
       // We have
       //

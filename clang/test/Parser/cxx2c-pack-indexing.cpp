@@ -83,3 +83,30 @@ void foo() {
 }
 
 }
+
+namespace TemplateIdPackIndexing {
+
+template <typename T>
+struct Inner {
+  using type = T;
+  static constexpr int value = 42;
+};
+
+template <template<typename> typename... TT>
+struct Test {
+  using type = TT<int>...[0]::type;
+  static constexpr auto value = TT<int>...[0]::value;
+};
+
+static_assert(Test<Inner>::value == 42);
+
+template <template<typename> typename... TT>
+struct Test2 {
+  template <typename U>
+  using type = typename TT<U>...[0]::template rebind<U>;
+};
+
+template <template<typename> typename... TT, typename U>
+auto test_unannotated() -> typename TT<U>...[0]::type;
+
+}
