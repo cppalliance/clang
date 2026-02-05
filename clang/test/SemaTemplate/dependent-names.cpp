@@ -1,4 +1,5 @@
 // RUN: %clang_cc1 -fsyntax-only -verify -std=c++11 %s
+// RUN: %clang_cc1 -fsyntax-only -verify -std=c++11 -fms-extensions %s
 
 typedef double A;
 template<typename T> class B {
@@ -481,3 +482,17 @@ namespace TransformNestedName {
   template <typename T::template X<N<T>::State::kA>>
   inline void N<T>::F() {}
 } // namespace TransformNestedName
+
+namespace GH133610 {
+  struct a {
+    using e = int;
+  };
+
+#ifdef _MSC_EXTENSIONS
+  void current(const char * = __builtin_FUNCSIG());
+  template <class> void c() {
+    decltype(a(current()))::e;
+  }
+#endif
+}
+

@@ -33,7 +33,7 @@ static CXXRecordDecl *getCurrentInstantiationOf(QualType T,
     return nullptr;
   auto *RD = cast<CXXRecordDecl>(TagTy->getDecl())->getDefinitionOrSelf();
   if (isa<InjectedClassNameType>(TagTy) ||
-      RD->isCurrentInstantiation(CurContext))
+      (RD->isDependentContext() && RD->isCurrentInstantiation(CurContext)))
     return RD;
   return nullptr;
 }
