@@ -44,6 +44,8 @@ int __attribute__((overloadable)) test (int);
 double __attribute__((overloadable)) test (double);
 char testc(char);
 
+int f(int);
+
 void PR30201(void) {
   _Generic(4, char:testc, default:test)(4); // ext-warning {{'_Generic' is a C11 extension}}
 }
@@ -86,3 +88,5 @@ void GH55562(void) {
   struct S s = { 0 };
   int i = s.a;
 }
+
+char *a = _Generic("", char (*)[f(x)]: ""); // expected-error {{use of undeclared identifier 'x'}} ext-warning {{'_Generic' is a C11 extension}}

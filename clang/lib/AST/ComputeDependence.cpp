@@ -721,6 +721,9 @@ ExprDependence clang::computeDependence(GenericSelectionExpr *E,
                                   : ExprDependence::None;
   for (auto *AE : E->getAssocExprs())
     D |= AE->getDependence() & ExprDependence::Error;
+  for (auto *TSI : E->getAssocTypeSourceInfos())
+    if (TSI && TSI->getType()->containsErrors())
+      D |= ExprDependence::Error;
 
   if (E->isExprPredicate())
     D |= E->getControllingExpr()->getDependence() & ExprDependence::Error;
