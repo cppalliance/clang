@@ -1127,36 +1127,35 @@ const SCEV *ScalarEvolution::getLosslessPtrToIntExpr(const SCEV *Op) {
 
 const SCEV *ScalarEvolution::getPtrToAddrExpr(const SCEV *Op) {
   assert(Op->getType()->isPointerTy() && "Op must be a pointer");
+
+  // Treat pointers with unstable representation conservatively, since the
+  // address bits may change.
+  if (DL.hasUnstableRepresentation(Op->getType()))
+    return getCouldNotCompute();
+
   Type *Ty = DL.getAddressType(Op->getType());
 
-  FoldingSetNodeID ID;
-  ID.AddInteger(scPtrToAddr);
-  ID.AddPointer(Op);
-
-  void *IP = nullptr;
-
-  // Is there already an expression for such a cast?
-  if (const SCEV *S = UniqueSCEVs.FindNodeOrInsertPos(ID, IP))
-    return S;
-
-  // If not, is this expression something we can't reduce any further?
-  if (auto *U = dyn_cast<SCEVUnknown>(Op)) {
-    // Perform some basic constant folding. If the operand of the ptr2addr cast
-    // is a null pointer, don't create a ptr2addr SCEV expression (that will be
-    // left as-is), but produce a zero constant.
-    // NOTE: We could handle a more general case, but lack motivational cases.
-    if (isa<ConstantPointerNull>(U->getValue()))
-      return getZero(Ty);
-  }
-
-  // Create an explicit cast node.
-  // We can reuse the existing insert position since if we get here,
-  // we won't have made any changes which would invalidate it.
-  SCEV *S =
-      new (SCEVAllocator) SCEVPtrToAddrExpr(ID.Intern(SCEVAllocator), Op, Ty);
-  UniqueSCEVs.InsertNode(S, IP);
-  registerUser(S, Op);
-  return S;
+  // Use the rewriter to sink the cast down to SCEVUnknown leaves.
+  // The rewriter handles null pointer constant folding.
+  const SCEV *IntOp = SCEVCastSinkingRewriter::rewrite(
+      Op, *this, Ty, [this, Ty](const SCEVUnknown *U) {
+        FoldingSetNodeID ID;
+        ID.AddInteger(scPtrToAddr);
+        ID.AddPointer(U);
+        ID.AddPointer(Ty);
+        void *IP = nullptr;
+        if (const SCEV *S = UniqueSCEVs.FindNodeOrInsertPos(ID, IP))
+          return S;
+        SCEV *S = new (SCEVAllocator)
+            SCEVPtrToAddrExpr(ID.Intern(SCEVAllocator), U, Ty);
+        UniqueSCEVs.InsertNode(S, IP);
+        registerUser(S, U);
+        return static_cast<const SCEV *>(S);
+      });
+  assert(IntOp->getType()->isIntegerTy() &&
+         "We must have succeeded in sinking the cast, "
+         "and ending up with an integer-typed expression!");
+  return IntOp;
 }
 
 const SCEV *ScalarEvolution::getPtrToIntExpr(const SCEV *Op, Type *Ty) {
@@ -5033,8 +5032,7 @@ public:
     bool IsPosBECond = false;
     Value *BECond = nullptr;
     if (BasicBlock *Latch = L->getLoopLatch()) {
-      BranchInst *BI = dyn_cast<BranchInst>(Latch->getTerminator());
-      if (BI && BI->isConditional()) {
+      if (CondBrInst *BI = dyn_cast<CondBrInst>(Latch->getTerminator())) {
         assert(BI->getSuccessor(0) != BI->getSuccessor(1) &&
                "Both outgoing branches should not target same header!");
         BECond = BI->getCondition();
@@ -6019,7 +6017,7 @@ const SCEV *ScalarEvolution::createAddRecFromPHI(PHINode *PN) {
 // Try to match a control flow sequence that branches out at BI and merges back
 // at Merge into a "C ? LHS : RHS" select pattern.  Return true on a successful
 // match.
-static bool BrPHIToSelect(DominatorTree &DT, BranchInst *BI, PHINode *Merge,
+static bool BrPHIToSelect(DominatorTree &DT, CondBrInst *BI, PHINode *Merge,
                           Value *&C, Value *&LHS, Value *&RHS) {
   C = BI->getCondition();
 
@@ -6068,11 +6066,10 @@ const SCEV *ScalarEvolution::createNodeFromSelectLikePHI(PHINode *PN) {
     BasicBlock *IDom = DT[PN->getParent()]->getIDom()->getBlock();
     assert(IDom && "At least the entry block should dominate PN");
 
-    auto *BI = dyn_cast<BranchInst>(IDom->getTerminator());
+    auto *BI = dyn_cast<CondBrInst>(IDom->getTerminator());
     Value *Cond = nullptr, *LHS = nullptr, *RHS = nullptr;
 
-    if (BI && BI->isConditional() &&
-        BrPHIToSelect(DT, BI, PN, Cond, LHS, RHS) &&
+    if (BI && BrPHIToSelect(DT, BI, PN, Cond, LHS, RHS) &&
         properlyDominates(getSCEV(LHS), PN->getParent()) &&
         properlyDominates(getSCEV(RHS), PN->getParent()))
       return createNodeForSelectOrPHI(PN, Cond, LHS, RHS);
@@ -8182,8 +8179,12 @@ const SCEV *ScalarEvolution::createSCEV(Value *V) {
       return getSCEV(U->getOperand(0));
     break;
 
-  case Instruction::PtrToAddr:
-    return getPtrToAddrExpr(getSCEV(U->getOperand(0)));
+  case Instruction::PtrToAddr: {
+    const SCEV *IntOp = getPtrToAddrExpr(getSCEV(U->getOperand(0)));
+    if (isa<SCEVCouldNotCompute>(IntOp))
+      return getUnknown(V);
+    return IntOp;
+  }
 
   case Instruction::PtrToInt: {
     // Pointer to integer cast is straight-forward, so do model it.
@@ -8955,7 +8956,7 @@ ScalarEvolution::computeBackedgeTakenCount(const Loop *L,
     // We canonicalize untaken exits to br (constant), ignore them so that
     // proving an exit untaken doesn't negatively impact our ability to reason
     // about the loop as whole.
-    if (auto *BI = dyn_cast<BranchInst>(ExitBB->getTerminator()))
+    if (auto *BI = dyn_cast<CondBrInst>(ExitBB->getTerminator()))
       if (auto *CI = dyn_cast<ConstantInt>(BI->getCondition())) {
         bool ExitIfTrue = !L->contains(BI->getSuccessor(0));
         if (ExitIfTrue == CI->isZero())
@@ -9046,8 +9047,7 @@ ScalarEvolution::computeExitLimit(const Loop *L, BasicBlock *ExitingBlock,
     return getCouldNotCompute();
 
   Instruction *Term = ExitingBlock->getTerminator();
-  if (BranchInst *BI = dyn_cast<BranchInst>(Term)) {
-    assert(BI->isConditional() && "If unconditional, it can't be in loop!");
+  if (CondBrInst *BI = dyn_cast<CondBrInst>(Term)) {
     bool ExitIfTrue = !L->contains(BI->getSuccessor(0));
     assert(ExitIfTrue == L->contains(BI->getSuccessor(1)) &&
            "It should have one successor in loop and one exit block!");
@@ -9638,7 +9638,7 @@ ScalarEvolution::ExitLimit ScalarEvolution::computeShiftCompareExitLimit(
   assert(Result->getType()->isIntegerTy(1) &&
          "Otherwise cannot be an operand to a branch instruction");
 
-  if (Result->isZeroValue()) {
+  if (Result->isNullValue()) {
     unsigned BitWidth = getTypeSizeInBits(RHS->getType());
     const SCEV *UpperBound =
         getConstant(getEffectiveSCEVType(RHS->getType()), BitWidth);
@@ -10029,8 +10029,7 @@ static Constant *BuildConstantFromSCEV(const SCEV *V) {
       if (OpC->getType()->isPointerTy()) {
         // The offsets have been converted to bytes.  We can add bytes using
         // an i8 GEP.
-        C = ConstantExpr::getGetElementPtr(Type::getInt8Ty(C->getContext()),
-                                           OpC, C);
+        C = ConstantExpr::getPtrAdd(OpC, C);
       } else {
         C = ConstantExpr::getAdd(C, OpC);
       }
@@ -11109,13 +11108,13 @@ bool ScalarEvolution::isKnownNonZero(const SCEV *S) {
 
 bool ScalarEvolution::isKnownToBeAPowerOfTwo(const SCEV *S, bool OrZero,
                                              bool OrNegative) {
-  auto NonRecursive = [this, OrNegative](const SCEV *S) {
+  auto NonRecursive = [OrNegative](const SCEV *S) {
     if (auto *C = dyn_cast<SCEVConstant>(S))
       return C->getAPInt().isPowerOf2() ||
              (OrNegative && C->getAPInt().isNegatedPowerOf2());
 
-    // The vscale_range indicates vscale is a power-of-two.
-    return isa<SCEVVScale>(S) && F.hasFnAttribute(Attribute::VScaleRange);
+    // vscale is a power-of-two.
+    return isa<SCEVVScale>(S);
   };
 
   if (NonRecursive(S))
@@ -11493,6 +11492,11 @@ ScalarEvolution::getLoopInvariantExitCondDuringFirstIterationsImpl(
   if (!AR || AR->getLoop() != L)
     return std::nullopt;
 
+  // Even if both are valid, we need to consistently chose the unsigned or the
+  // signed predicate below, not mixtures of both. For now, prefer the unsigned
+  // predicate.
+  Pred = Pred.dropSameSign();
+
   // The predicate must be relational (i.e. <, <=, >=, >).
   if (!ICmpInst::isRelational(Pred))
     return std::nullopt;
@@ -11523,7 +11527,7 @@ ScalarEvolution::getLoopInvariantExitCondDuringFirstIterationsImpl(
   ICmpInst::Predicate NoOverflowPred =
       CmpInst::isSigned(Pred) ? ICmpInst::ICMP_SLE : ICmpInst::ICMP_ULE;
   if (Step == MinusOne)
-    NoOverflowPred = ICmpInst::getSwappedCmpPredicate(NoOverflowPred);
+    NoOverflowPred = ICmpInst::getSwappedPredicate(NoOverflowPred);
   const SCEV *Start = AR->getStart();
   if (!isKnownPredicateAt(NoOverflowPred, Start, Last, CtxI))
     return std::nullopt;
@@ -11722,11 +11726,10 @@ bool ScalarEvolution::isLoopBackedgeGuardedByCond(const Loop *L,
   if (!Latch)
     return false;
 
-  BranchInst *LoopContinuePredicate =
-    dyn_cast<BranchInst>(Latch->getTerminator());
-  if (LoopContinuePredicate && LoopContinuePredicate->isConditional() &&
-      isImpliedCond(Pred, LHS, RHS,
-                    LoopContinuePredicate->getCondition(),
+  CondBrInst *LoopContinuePredicate =
+      dyn_cast<CondBrInst>(Latch->getTerminator());
+  if (LoopContinuePredicate &&
+      isImpliedCond(Pred, LHS, RHS, LoopContinuePredicate->getCondition(),
                     LoopContinuePredicate->getSuccessor(0) != L->getHeader()))
     return true;
 
@@ -11780,8 +11783,8 @@ bool ScalarEvolution::isLoopBackedgeGuardedByCond(const Loop *L,
     if (!PBB)
       continue;
 
-    BranchInst *ContinuePredicate = dyn_cast<BranchInst>(PBB->getTerminator());
-    if (!ContinuePredicate || !ContinuePredicate->isConditional())
+    CondBrInst *ContinuePredicate = dyn_cast<CondBrInst>(PBB->getTerminator());
+    if (!ContinuePredicate)
       continue;
 
     Value *Condition = ContinuePredicate->getCondition();
@@ -11872,9 +11875,9 @@ bool ScalarEvolution::isBasicBlockEntryGuardedByCond(const BasicBlock *BB,
     PredBB = BB->getSinglePredecessor();
   for (std::pair<const BasicBlock *, const BasicBlock *> Pair(PredBB, BB);
        Pair.first; Pair = getPredecessorWithUniqueSuccessorForBB(Pair.first)) {
-    const BranchInst *BlockEntryPredicate =
-        dyn_cast<BranchInst>(Pair.first->getTerminator());
-    if (!BlockEntryPredicate || BlockEntryPredicate->isUnconditional())
+    const CondBrInst *BlockEntryPredicate =
+        dyn_cast<CondBrInst>(Pair.first->getTerminator());
+    if (!BlockEntryPredicate)
       continue;
 
     if (ProveViaCond(BlockEntryPredicate->getCondition(),
@@ -15893,9 +15896,9 @@ void ScalarEvolution::LoopGuards::collectFromBlock(
   for (; Pair.first;
        Pair = SE.getPredecessorWithUniqueSuccessorForBB(Pair.first)) {
     VisitedBlocks.insert(Pair.second);
-    const BranchInst *LoopEntryPredicate =
-        dyn_cast<BranchInst>(Pair.first->getTerminator());
-    if (!LoopEntryPredicate || LoopEntryPredicate->isUnconditional())
+    const CondBrInst *LoopEntryPredicate =
+        dyn_cast<CondBrInst>(Pair.first->getTerminator());
+    if (!LoopEntryPredicate)
       continue;
 
     Terms.emplace_back(LoopEntryPredicate->getCondition(),

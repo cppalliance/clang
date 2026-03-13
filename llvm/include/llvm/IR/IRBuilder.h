@@ -528,8 +528,7 @@ public:
     return ConstantInt::get(getInt64Ty(), C);
   }
 
-  /// Get a constant N-bit value, zero extended or truncated from
-  /// a 64-bit value.
+  /// Get a constant N-bit value, zero extended from a 64-bit value.
   ConstantInt *getIntN(unsigned N, uint64_t C) {
     return ConstantInt::get(getIntNTy(N), C);
   }
@@ -969,6 +968,10 @@ public:
   /// in poison if type \p Ty is not big enough to hold the value.
   LLVM_ABI Value *CreateTypeSize(Type *Ty, TypeSize Size);
 
+  /// Get allocation size of an alloca as a runtime Value* (handles both static
+  /// and dynamic allocas and vscale factor).
+  LLVM_ABI Value *CreateAllocationSize(Type *DestTy, AllocaInst *AI);
+
   /// Creates a vector of type \p DstType with the linear sequence <0, 1, ...>
   LLVM_ABI Value *CreateStepVector(Type *DstType, const Twine &Name = "");
 
@@ -1188,24 +1191,24 @@ public:
   }
 
   /// Create an unconditional 'br label X' instruction.
-  BranchInst *CreateBr(BasicBlock *Dest) {
-    return Insert(BranchInst::Create(Dest));
+  UncondBrInst *CreateBr(BasicBlock *Dest) {
+    return Insert(UncondBrInst::Create(Dest));
   }
 
   /// Create a conditional 'br Cond, TrueDest, FalseDest'
   /// instruction.
-  BranchInst *CreateCondBr(Value *Cond, BasicBlock *True, BasicBlock *False,
+  CondBrInst *CreateCondBr(Value *Cond, BasicBlock *True, BasicBlock *False,
                            MDNode *BranchWeights = nullptr,
                            MDNode *Unpredictable = nullptr) {
-    return Insert(addBranchMetadata(BranchInst::Create(True, False, Cond),
+    return Insert(addBranchMetadata(CondBrInst::Create(Cond, True, False),
                                     BranchWeights, Unpredictable));
   }
 
   /// Create a conditional 'br Cond, TrueDest, FalseDest'
   /// instruction. Copy branch meta data if available.
-  BranchInst *CreateCondBr(Value *Cond, BasicBlock *True, BasicBlock *False,
+  CondBrInst *CreateCondBr(Value *Cond, BasicBlock *True, BasicBlock *False,
                            Instruction *MDSrc) {
-    BranchInst *Br = BranchInst::Create(True, False, Cond);
+    CondBrInst *Br = CondBrInst::Create(Cond, True, False);
     if (MDSrc) {
       unsigned WL[4] = {LLVMContext::MD_prof, LLVMContext::MD_unpredictable,
                         LLVMContext::MD_make_implicit, LLVMContext::MD_dbg};
@@ -2291,6 +2294,13 @@ public:
   /// not specified.
   LLVM_ABI Value *CreateAggregateCast(Value *V, Type *DestTy);
 
+  /// Create a chain of casts to convert V to NewTy, preserving the bit pattern
+  /// of V. This may involve multiple casts (e.g., ptr -> i64 -> <2 x i32>).
+  /// The created cast instructions are inserted into the current basic block.
+  /// If no casts are needed, V is returned.
+  LLVM_ABI Value *CreateBitPreservingCastChain(const DataLayout &DL, Value *V,
+                                               Type *NewTy);
+
   //===--------------------------------------------------------------------===//
   // Instruction creation methods: Compare Instructions
   //===--------------------------------------------------------------------===//
@@ -2643,8 +2653,14 @@ public:
                          Name);
   }
 
-  /// Return the i64 difference between two pointer values, dividing out
-  /// the size of the pointed-to objects.
+  /// Return the difference between two pointer values. The returned value
+  /// type is the address type of the pointers.
+  LLVM_ABI Value *CreatePtrDiff(Value *LHS, Value *RHS, const Twine &Name = "",
+                                bool IsNUW = false);
+
+  /// Return the difference between two pointer values, dividing out the size
+  /// of the pointed-to objects. The returned value type is the address type
+  /// of the pointers.
   ///
   /// This is intended to implement C-style pointer subtraction. As such, the
   /// pointers must be appropriately aligned for their element types and
