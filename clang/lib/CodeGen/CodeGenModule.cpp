@@ -557,6 +557,39 @@ CodeGenModule::CodeGenModule(ASTContext &C,
 
 CodeGenModule::~CodeGenModule() {}
 
+SanitizerSet CodeGenModule::getProfileCoreUBChecks() const {
+  SanitizerSet Checks;
+  if (!LangOpts.Profiles || !Context.isProfileEnforced("std::core_ub"))
+    return Checks;
+  // The locally checkable cases of P4317 Appendix A.1, each reusing the UBSan
+  // check that already implements it. One case is added per commit.
+  Checks.set(SanitizerKind::IntegerDivideByZero, true); // {expr.mul.div.by.zero}
+  // {expr.mul.representable.type.result}: signed +, -, *, unary -, and the
+  // INT_MIN/-1 division whose quotient is not representable.
+  Checks.set(SanitizerKind::SignedIntegerOverflow, true);
+  // {expr.shift.neg.and.width}: a shift width that is negative or at least the
+  // operand width (exponent), or a signed left shift that loses bits (base).
+  Checks.set(SanitizerKind::ShiftBase, true);
+  Checks.set(SanitizerKind::ShiftExponent, true);
+  // {basic.align.object.alignment}: an access through a pointer that does not
+  // meet the referenced type's alignment.
+  Checks.set(SanitizerKind::Alignment, true);
+  // {expr.unary.dereference}, null case: dereferencing a null pointer.
+  Checks.set(SanitizerKind::Null, true);
+  // {expr.add.out.of.bounds}, statically known bound: indexing past the end of
+  // an array whose bound is visible at the subscript.
+  Checks.set(SanitizerKind::ArrayBounds, true);
+  // {conv.fpint.*} and {conv.double.out.of.range}: a floating-point value whose
+  // truncation toward zero is outside the destination type's range.
+  Checks.set(SanitizerKind::FloatCastOverflow, true);
+  // {expr.static.cast.enum.outside.range}: loading an enumeration value that is
+  // outside the range of its enumerators.
+  Checks.set(SanitizerKind::Enum, true);
+  // {stmt.return.flow.off}: flowing off the end of a value-returning function.
+  Checks.set(SanitizerKind::Return, true);
+  return Checks;
+}
+
 void CodeGenModule::createObjCRuntime() {
   // This is just isGNUFamily(), but we want to force implementors of
   // new ABIs to decide how best to do this.
