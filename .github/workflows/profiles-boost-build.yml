@@ -28,7 +28,8 @@ jobs:
     name: Build Boost (std::init enforced)
     # ubuntu-24.04 for a newer libstdc++ (cleaner c++23); the 22.04-built clang
     # runs fine here.
-    runs-on: ubuntu-24.04
+    # runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - name: Checkout profiles branch (helpers)
         uses: actions/checkout@v4
