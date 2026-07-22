@@ -80,17 +80,110 @@ jobs:
       - name: Build Boost with std::init enforced
         working-directory: boost
         run: |
-          set -o pipefail
-          # Violations are hard errors, so b2 is expected to exit non-zero; the
-          # log is the deliverable, so never fail the job on that.
-          ./b2 \
-            --user-config="$GITHUB_WORKSPACE/clang/utils/profiles-boost/user-config.jam" \
-            toolset=clang-profiles \
-            cxxstd=23 \
-            testing.execute=off \
-            -k -j"$(nproc)" \
-            libs/*/test \
-            2>&1 | tee "$GITHUB_WORKSPACE/boost-profiles.log" || true
+          ws="$GITHUB_WORKSPACE"
+          log="$ws/boost-profiles.log"
+          diag="$ws/profiles-diag.log"
+          : > "$diag"
+          rm -f "$ws"/part-*.log
+
+          b2flags=(
+            --user-config="$ws/clang/utils/profiles-boost/user-config.jam"
+            toolset=clang-profiles
+            cxxstd=23
+            testing.execute=off
+          )
+          nproc_n=$(nproc)
+
+          # --- Why this is split -------------------------------------------------
+          # The bottleneck is the SINGLE-THREADED b2 driver: with the whole
+          # libs/*/test graph in one process it pegs one core doing dependency
+          # scanning/binding while ~150 compiles sit idle waiting to be fed. More
+          # cores can't help one b2. Boost.Math is the pathological tail (its
+          # autodiff special-function *compile* tests dominate), so we run many b2
+          # drivers in parallel, each over a disjoint chunk of Math targets, each
+          # in its own --build-dir so concurrent drivers can't race on shared
+          # config-check/library targets. Everything else builds first in one b2
+          # (the wide, fast part). Per-chunk logs are concatenated into the exact
+          # same boost-profiles.log; summarize.py parses it order-independently.
+
+          # --- Background resource sampler (observation only) --------------------
+          # A few lines/min: shows whether compiles are genuinely Running vs.
+          # blocked (D) on I/O, and how many b2 drivers are live. Uploaded as an
+          # artifact so we can confirm the split actually keeps the cores busy.
+          sample() {
+            set +e
+            while :; do
+              ts=$(date -u +%H:%M:%S)
+              read -r l1 _ < /proc/loadavg
+              running=$(awk '/procs_running/{print $2}' /proc/stat)
+              blocked=$(awk '/procs_blocked/{print $2}' /proc/stat)
+              memav=$(awk '/MemAvailable/{printf "%.0f", $2/1024}' /proc/meminfo)
+              clang_r=$(ps -eo stat,comm | awk '$2 ~ /^clang/ && $1 ~ /^R/' | wc -l)
+              clang_d=$(ps -eo stat,comm | awk '$2 ~ /^clang/ && $1 ~ /^D/' | wc -l)
+              clang_t=$(ps -eo comm | grep -c '^clang')
+              b2n=$(pgrep -xc b2 2>/dev/null || echo 0)
+              printf '[%s] load=%s run=%s blk=%s memAvailMB=%s clang(tot=%s R=%s D=%s) b2procs=%s\n' \
+                "$ts" "$l1" "$running" "$blocked" "$memav" \
+                "$clang_t" "$clang_r" "$clang_d" "$b2n" >> "$diag"
+              sleep 15
+            done
+          }
+          sample & sampler=$!
+          tail -f "$diag" & tailpid=$!
+          trap 'kill "$sampler" "$tailpid" 2>/dev/null || true' EXIT
+
+          start=$(date +%s)
+
+          # 1) Everything except Math: one b2, full width. Also materializes the
+          #    shared config checks and compiled Boost libraries.
+          nonmath=()
+          for d in libs/*/test; do
+            [ "$d" = libs/math/test ] || nonmath+=("$d")
+          done
+          echo "== phase 1: non-math ($nproc_n-way) ==" >> "$diag"
+          ./b2 "${b2flags[@]}" -k -j"$nproc_n" "${nonmath[@]}" \
+            > "$ws/part-000-rest.log" 2>&1 || true
+
+          # 2) Enumerate Math test targets authoritatively from b2's own plan
+          #    (never from guessed source names), then build them in parallel.
+          ./b2 "${b2flags[@]}" libs/math/test -n 2>/dev/null \
+            | grep -oP 'bin\.v2/libs/math/test/\K[^/]+(?=\.test)' \
+            | sort -u > "$ws/math-names.txt" || true
+          n_math=$(wc -l < "$ws/math-names.txt" 2>/dev/null || echo 0)
+          echo "== phase 2: math targets enumerated: $n_math ==" >> "$diag"
+
+          if [ "$n_math" -eq 0 ]; then
+            # Enumeration failed for some reason -> never lose coverage: build
+            # Math in a single b2 (correct, just not parallelized).
+            echo "== math enumeration empty; single-b2 fallback ==" >> "$diag"
+            ./b2 "${b2flags[@]}" -k -j"$nproc_n" libs/math/test \
+              > "$ws/part-math-fallback.log" 2>&1 || true
+          else
+            outer=16
+            [ "$outer" -gt "$n_math" ] && outer="$n_math"
+            inner=$(( nproc_n / outer )); [ "$inner" -lt 1 ] && inner=1
+            echo "== math: $outer parallel b2 x -j$inner ==" >> "$diag"
+            split -d -n "r/$outer" "$ws/math-names.txt" "$RUNNER_TEMP/mchunk_"
+            i=0; pids=()
+            for c in "$RUNNER_TEMP"/mchunk_*; do
+              ids=$(sed 's#^#libs/math/test//#' "$c" | tr '\n' ' ')
+              [ -z "${ids// /}" ] && continue
+              ./b2 "${b2flags[@]}" --build-dir="$RUNNER_TEMP/mbd_$i" \
+                -k -j"$inner" $ids > "$ws/part-math-$i.log" 2>&1 &
+              pids+=($!)
+              i=$((i + 1))
+            done
+            wait "${pids[@]}" 2>/dev/null || true
+          fi
+
+          # 3) Merge per-chunk logs into the one deliverable, unchanged in format.
+          cat "$ws"/part-*.log > "$log" 2>/dev/null || true
+          end=$(date +%s)
+
+          kill "$sampler" "$tailpid" 2>/dev/null || true
+          printf 'done in %ss; boost-profiles.log lines: %s (from %s part files)\n' \
+            "$((end - start))" "$(wc -l < "$log")" \
+            "$(ls "$ws"/part-*.log 2>/dev/null | wc -l)" | tee -a "$diag"
 
       - name: Summarize & visualize profile violations
         if: always()
@@ -110,6 +203,7 @@ jobs:
           name: boost-profiles-log
           path: |
             boost-profiles.log
+            profiles-diag.log
             summary.json
             report.html
             crash/
