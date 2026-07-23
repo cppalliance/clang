@@ -82,8 +82,6 @@ jobs:
         run: |
           ws="$GITHUB_WORKSPACE"
           log="$ws/boost-profiles.log"
-          diag="$ws/profiles-diag.log"
-          : > "$diag"
           rm -f "$ws"/part-*.log
 
           b2flags=(
@@ -105,32 +103,11 @@ jobs:
           # config-check/library targets. Everything else builds first in one b2
           # (the wide, fast part). Per-chunk logs are concatenated into the exact
           # same boost-profiles.log; summarize.py parses it order-independently.
-
-          # --- Background resource sampler (observation only) --------------------
-          # A few lines/min: shows whether compiles are genuinely Running vs.
-          # blocked (D) on I/O, and how many b2 drivers are live. Uploaded as an
-          # artifact so we can confirm the split actually keeps the cores busy.
-          sample() {
-            set +e
-            while :; do
-              ts=$(date -u +%H:%M:%S)
-              read -r l1 _ < /proc/loadavg
-              running=$(awk '/procs_running/{print $2}' /proc/stat)
-              blocked=$(awk '/procs_blocked/{print $2}' /proc/stat)
-              memav=$(awk '/MemAvailable/{printf "%.0f", $2/1024}' /proc/meminfo)
-              clang_r=$(ps -eo stat,comm | awk '$2 ~ /^clang/ && $1 ~ /^R/' | wc -l)
-              clang_d=$(ps -eo stat,comm | awk '$2 ~ /^clang/ && $1 ~ /^D/' | wc -l)
-              clang_t=$(ps -eo comm | grep -c '^clang')
-              b2n=$(pgrep -xc b2 2>/dev/null || echo 0)
-              printf '[%s] load=%s run=%s blk=%s memAvailMB=%s clang(tot=%s R=%s D=%s) b2procs=%s\n' \
-                "$ts" "$l1" "$running" "$blocked" "$memav" \
-                "$clang_t" "$clang_r" "$clang_d" "$b2n" >> "$diag"
-              sleep 15
-            done
-          }
-          sample & sampler=$!
-          tail -f "$diag" & tailpid=$!
-          trap 'kill "$sampler" "$tailpid" 2>/dev/null || true' EXIT
+          #
+          # Output is streamed live to the Actions log: phase 1 via `tee`, and
+          # the parallel Math phase via `tail -f` on the per-chunk part files (a
+          # single b2 can't stream to the console and write its own file without
+          # interleaving corruption, so each writes a file and we mirror them).
 
           start=$(date +%s)
 
@@ -140,9 +117,9 @@ jobs:
           for d in libs/*/test; do
             [ "$d" = libs/math/test ] || nonmath+=("$d")
           done
-          echo "== phase 1: non-math ($nproc_n-way) ==" >> "$diag"
-          ./b2 "${b2flags[@]}" -k -j"$nproc_n" "${nonmath[@]}" \
-            > "$ws/part-000-rest.log" 2>&1 || true
+          echo "== phase 1: non-math ($nproc_n-way) =="
+          ./b2 "${b2flags[@]}" -k -j"$nproc_n" "${nonmath[@]}" 2>&1 \
+            | tee "$ws/part-000-rest.log" || true
 
           # 2) Enumerate Math test targets authoritatively from b2's own plan
           #    (never from guessed source names), then build them in parallel.
@@ -150,19 +127,19 @@ jobs:
             | grep -oP 'bin\.v2/libs/math/test/\K[^/]+(?=\.test)' \
             | sort -u > "$ws/math-names.txt" || true
           n_math=$(wc -l < "$ws/math-names.txt" 2>/dev/null || echo 0)
-          echo "== phase 2: math targets enumerated: $n_math ==" >> "$diag"
+          echo "== phase 2: math targets enumerated: $n_math =="
 
           if [ "$n_math" -eq 0 ]; then
             # Enumeration failed for some reason -> never lose coverage: build
             # Math in a single b2 (correct, just not parallelized).
-            echo "== math enumeration empty; single-b2 fallback ==" >> "$diag"
-            ./b2 "${b2flags[@]}" -k -j"$nproc_n" libs/math/test \
-              > "$ws/part-math-fallback.log" 2>&1 || true
+            echo "== math enumeration empty; single-b2 fallback =="
+            ./b2 "${b2flags[@]}" -k -j"$nproc_n" libs/math/test 2>&1 \
+              | tee "$ws/part-math-fallback.log" || true
           else
             outer=16
             [ "$outer" -gt "$n_math" ] && outer="$n_math"
             inner=$(( nproc_n / outer )); [ "$inner" -lt 1 ] && inner=1
-            echo "== math: $outer parallel b2 x -j$inner ==" >> "$diag"
+            echo "== phase 2: math via $outer parallel b2 x -j$inner =="
             split -d -n "r/$outer" "$ws/math-names.txt" "$RUNNER_TEMP/mchunk_"
             i=0; pids=()
             for c in "$RUNNER_TEMP"/mchunk_*; do
@@ -173,17 +150,20 @@ jobs:
               pids+=($!)
               i=$((i + 1))
             done
+            # Mirror all chunk logs to the Actions console in real time; the b2
+            # processes remain the source of truth for the merge.
+            tail -n +1 -f "$ws"/part-math-*.log & tailpid=$!
+            trap 'kill "$tailpid" 2>/dev/null || true' EXIT
             wait "${pids[@]}" 2>/dev/null || true
+            kill "$tailpid" 2>/dev/null || true
           fi
 
           # 3) Merge per-chunk logs into the one deliverable, unchanged in format.
           cat "$ws"/part-*.log > "$log" 2>/dev/null || true
           end=$(date +%s)
-
-          kill "$sampler" "$tailpid" 2>/dev/null || true
           printf 'done in %ss; boost-profiles.log lines: %s (from %s part files)\n' \
             "$((end - start))" "$(wc -l < "$log")" \
-            "$(ls "$ws"/part-*.log 2>/dev/null | wc -l)" | tee -a "$diag"
+            "$(ls "$ws"/part-*.log 2>/dev/null | wc -l)"
 
       - name: Summarize & visualize profile violations
         if: always()
@@ -203,7 +183,6 @@ jobs:
           name: boost-profiles-log
           path: |
             boost-profiles.log
-            profiles-diag.log
             summary.json
             report.html
             crash/
