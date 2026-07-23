@@ -18,6 +18,10 @@ on:
         description: "Boost superproject git ref (branch or tag)"
         required: false
         default: "master"
+      math_shards:
+        description: "Number of parallel b2 drivers for the Boost.Math test phase (more = more cores used; total -j stays ~nproc)"
+        required: false
+        default: "64"
 
 permissions:
   actions: read
@@ -30,6 +34,9 @@ jobs:
     # runs fine here.
     # runs-on: ubuntu-24.04
     runs-on: [self-hosted, Linux, X64]
+    # The GitHub-hosted 6h job cap does NOT apply to self-hosted runners; the 6h we
+    # hit before was just the default timeout-minutes (360). Raise it to 12h.
+    timeout-minutes: 720
     steps:
       - name: Checkout profiles branch (helpers)
         uses: actions/checkout@v4
@@ -82,7 +89,7 @@ jobs:
         run: |
           ws="$GITHUB_WORKSPACE"
           log="$ws/boost-profiles.log"
-          rm -f "$ws"/part-*.log
+          rm -f "$ws"/part-*.log "$log" "$log.tmp"
 
           b2flags=(
             --user-config="$ws/clang/utils/profiles-boost/user-config.jam"
@@ -95,19 +102,35 @@ jobs:
           # --- Why this is split -------------------------------------------------
           # The bottleneck is the SINGLE-THREADED b2 driver: with the whole
           # libs/*/test graph in one process it pegs one core doing dependency
-          # scanning/binding while ~150 compiles sit idle waiting to be fed. More
-          # cores can't help one b2. Boost.Math is the pathological tail (its
-          # autodiff special-function *compile* tests dominate), so we run many b2
-          # drivers in parallel, each over a disjoint chunk of Math targets, each
-          # in its own --build-dir so concurrent drivers can't race on shared
-          # config-check/library targets. Everything else builds first in one b2
-          # (the wide, fast part). Per-chunk logs are concatenated into the exact
-          # same boost-profiles.log; summarize.py parses it order-independently.
+          # scanning/binding + serializing every compile's (very verbose) output,
+          # while the actual compiles sit blocked (we observed procs_running=0 -- the
+          # driver couldn't even feed -j3). More cores can't help one b2, and a
+          # bigger inner -j doesn't either; the lever that helps is MORE b2 DRIVERS.
+          # Boost.Math is the pathological tail (autodiff/special-function *compile*
+          # tests), so we fan it out across many b2 drivers (math_shards), each over
+          # a disjoint chunk of Math targets in its own --build-dir (so concurrent
+          # drivers can't race on shared config-check/library targets). Everything
+          # else builds first in one wide b2. Total concurrency stays ~nproc: the
+          # inner -j shrinks as the shard count grows (inner = nproc / shards).
           #
-          # Output is streamed live to the Actions log: phase 1 via `tee`, and
-          # the parallel Math phase via `tail -f` on the per-chunk part files (a
-          # single b2 can't stream to the console and write its own file without
-          # interleaving corruption, so each writes a file and we mirror them).
+          # Output is streamed live to the Actions log: phase 1 via `tee`, the
+          # parallel Math phase via `tail -f` on the per-chunk part files (a single
+          # b2 can't stream to the console and write its own file without interleave
+          # corruption, so each writes a file and we mirror them).
+
+          # --- Incremental result collector -------------------------------------
+          # Previously boost-profiles.log was assembled only on the final line, so a
+          # timeout left it EMPTY and the whole (multi-hour) run produced nothing.
+          # Instead, merge the per-shard part files into the deliverable continuously
+          # (atomic rename), so whenever the job stops -- success OR timeout -- the
+          # log holds everything finished so far and the summarize/upload steps
+          # (if: always()) have real data to work with.
+          merge_now() { cat "$ws"/part-*.log > "$log.tmp" 2>/dev/null && mv "$log.tmp" "$log" || true; }
+          collector() { while :; do merge_now; sleep 20; done; }
+          collector & collectorpid=$!
+          tailpid=""
+          cleanup() { kill "$collectorpid" ${tailpid:+$tailpid} 2>/dev/null || true; }
+          trap cleanup EXIT
 
           start=$(date +%s)
 
@@ -136,30 +159,33 @@ jobs:
             ./b2 "${b2flags[@]}" -k -j"$nproc_n" libs/math/test 2>&1 \
               | tee "$ws/part-math-fallback.log" || true
           else
-            outer=16
+            outer="${{ inputs.math_shards || '64' }}"
+            [ "$outer" -lt 1 ] 2>/dev/null && outer=1
             [ "$outer" -gt "$n_math" ] && outer="$n_math"
             inner=$(( nproc_n / outer )); [ "$inner" -lt 1 ] && inner=1
             echo "== phase 2: math via $outer parallel b2 x -j$inner =="
-            split -d -n "r/$outer" "$ws/math-names.txt" "$RUNNER_TEMP/mchunk_"
+            split -d -a 4 -n "r/$outer" "$ws/math-names.txt" "$RUNNER_TEMP/mchunk_"
             i=0; pids=()
             for c in "$RUNNER_TEMP"/mchunk_*; do
               ids=$(sed 's#^#libs/math/test//#' "$c" | tr '\n' ' ')
               [ -z "${ids// /}" ] && continue
               ./b2 "${b2flags[@]}" --build-dir="$RUNNER_TEMP/mbd_$i" \
-                -k -j"$inner" $ids > "$ws/part-math-$i.log" 2>&1 &
+                -k -j"$inner" $ids > "$ws/part-math-$(printf '%04d' "$i").log" 2>&1 &
               pids+=($!)
               i=$((i + 1))
             done
             # Mirror all chunk logs to the Actions console in real time; the b2
             # processes remain the source of truth for the merge.
             tail -n +1 -f "$ws"/part-math-*.log & tailpid=$!
-            trap 'kill "$tailpid" 2>/dev/null || true' EXIT
             wait "${pids[@]}" 2>/dev/null || true
-            kill "$tailpid" 2>/dev/null || true
+            kill "$tailpid" 2>/dev/null || true; tailpid=""
           fi
 
-          # 3) Merge per-chunk logs into the one deliverable, unchanged in format.
-          cat "$ws"/part-*.log > "$log" 2>/dev/null || true
+          # 3) Final authoritative merge (the collector already refreshes the log
+          #    every 20s during the build; this captures the last bytes and covers
+          #    the happy, no-timeout path).
+          kill "$collectorpid" 2>/dev/null || true
+          merge_now
           end=$(date +%s)
           printf 'done in %ss; boost-profiles.log lines: %s (from %s part files)\n' \
             "$((end - start))" "$(wc -l < "$log")" \
