@@ -22,10 +22,10 @@ on:
         description: "Number of parallel b2 drivers for the Boost.Math test phase (more = more cores used; total -j stays ~nproc)"
         required: false
         default: "64"
-      build_budget_minutes:
-        description: "Soft time budget for the build step; on expiry it stops b2, publishes partial results, and still SUCCEEDS (job stays green). Keep below the job timeout-minutes."
+      math_budget_minutes:
+        description: "Soft time budget for the Boost.Math phase only; on expiry it stops b2, publishes partial results, and still SUCCEEDS (job stays green). Math finishes fast or never, so this can be small."
         required: false
-        default: "690"
+        default: "90"
 
 permissions:
   actions: read
@@ -38,9 +38,11 @@ jobs:
     # runs fine here.
     # runs-on: ubuntu-24.04
     runs-on: [self-hosted, Linux, X64]
-    # The GitHub-hosted 6h job cap does NOT apply to self-hosted runners; the 6h we
-    # hit before was just the default timeout-minutes (360). Raise it to 12h.
-    timeout-minutes: 720
+    # Hard backstop only. The build step enforces its own (much smaller) soft
+    # budget on the math phase and exits 0, so this should never fire; it just
+    # prevents a runaway if that watchdog itself breaks. Keep it above the soft
+    # budget (math_budget_minutes) + phase 1.
+    timeout-minutes: 240
     steps:
       - name: Checkout profiles branch (helpers)
         uses: actions/checkout@v4
@@ -141,21 +143,24 @@ jobs:
           # normally. The timeout is surfaced as a yellow ::warning:: annotation
           # plus a job-summary note (a run that stopped with one straggler shard
           # still captured ~all of the data -- that's a success, not a failure).
-          # The job-level timeout-minutes remains only as a hard backstop set well
-          # above this soft budget. Genuine failures in *other* steps still fail
-          # the job as usual.
-          budget_min="${{ inputs.build_budget_minutes || '690' }}"
+          # Genuine failures in *other* steps still fail the job as usual.
+          #
+          # It is scoped to the MATH phase only: empirically math is all-or-nothing
+          # -- a shard either finishes within minutes or wedges forever (b2 pegged,
+          # zero new output) -- so there is nothing to gain by waiting. Phase 1 is
+          # fast and not subject to this stall, so it runs before the clock starts.
+          budget_min="${{ inputs.math_budget_minutes || '60' }}"
           timedout="$ws/.build-timedout"; rm -f "$timedout"
           watchdog() {
             sleep "$(( budget_min * 60 ))"
             : > "$timedout"
-            echo "::warning title=Build soft-timeout::Boost build hit the ${budget_min}-minute budget; stopping b2 and publishing partial results (job kept green)."
+            echo "::warning title=Math soft-timeout::Boost.Math hit the ${budget_min}-minute budget; stopping b2 and publishing partial results (job kept green)."
             pkill -x b2 2>/dev/null || true
           }
-          watchdog & watchdogpid=$!
+          watchdogpid=""
 
           tailpid=""
-          cleanup() { kill "$collectorpid" "$watchdogpid" ${tailpid:+$tailpid} 2>/dev/null || true; }
+          cleanup() { kill "$collectorpid" ${watchdogpid:+$watchdogpid} ${tailpid:+$tailpid} 2>/dev/null || true; }
           trap cleanup EXIT
 
           start=$(date +%s)
@@ -170,10 +175,12 @@ jobs:
           ./b2 "${b2flags[@]}" -k -j"$nproc_n" "${nonmath[@]}" 2>&1 \
             | tee "$ws/part-000-rest.log" || true
 
+          # Start the math-phase soft-timeout clock now (phase 1 is done).
+          watchdog & watchdogpid=$!
+
           # 2) Enumerate Math test targets authoritatively from b2's own plan
           #    (never from guessed source names), then build them in parallel.
-          #    Skipped if the soft budget already expired during phase 1 (defensive;
-          #    phase 1 is ~minutes, the budget is hours).
+          #    Guarded by the soft-timeout flag (defensive; normally not yet set).
           if [ ! -f "$timedout" ]; then
           ./b2 "${b2flags[@]}" libs/math/test -n 2>/dev/null \
             | grep -oP 'bin\.v2/libs/math/test/\K[^/]+(?=\.test)' \
@@ -214,7 +221,7 @@ jobs:
           # 3) Final authoritative merge (the collector already refreshes the log
           #    every 20s during the build; this captures the last bytes and covers
           #    the happy, no-timeout path).
-          kill "$collectorpid" "$watchdogpid" 2>/dev/null || true
+          kill "$collectorpid" ${watchdogpid:+$watchdogpid} 2>/dev/null || true
           merge_now
           end=$(date +%s)
           printf 'done in %ss; boost-profiles.log lines: %s (from %s part files)\n' \
