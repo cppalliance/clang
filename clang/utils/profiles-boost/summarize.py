@@ -134,6 +134,13 @@ def parse_log(lines, boost_root=None):
     matrix = defaultdict(Counter)   # library -> rule -> count
     by_file = Counter()
     files = set()
+    # Counts are deduplicated by distinct source site (file, line, col): a
+    # violation in a header or template is re-emitted once per translation unit
+    # and per instantiation, so raw emission counts are inflated (often ~80x).
+    # A site is what a library author would actually fix, so it is the unit we
+    # report; raw_emissions is kept for context / the inflation factor.
+    seen_sites = set()
+    raw_emissions = 0
     crash_markers = 0
     non_profile_errors = 0
     cache = {}
@@ -152,7 +159,12 @@ def parse_log(lines, boost_root=None):
         if pm.group("profile") != "std::init":
             # A different profile (e.g. a test:: profile); not counted here.
             continue
+        raw_emissions += 1
         path = m.group("path")
+        site = (path, m.group("line"), m.group("col"))
+        if site in seen_sites:
+            continue
+        seen_sites.add(site)
         rule = classify_rule(msg)
         lib = library_for_path(path, boost_root, cache)
         by_rule[rule] += 1
@@ -161,9 +173,10 @@ def parse_log(lines, boost_root=None):
         by_file[path] += 1
         files.add(path)
 
-    total = sum(by_rule.values())
+    total = sum(by_rule.values())   # == number of distinct sites
     return {
-        "total_violations": total,
+        "total_violations": total,       # distinct (file, line, col) sites
+        "raw_emissions": raw_emissions,  # total error lines before dedup
         "files": len(files),
         "libraries": len(by_library),
         "crash_markers": crash_markers,
@@ -199,9 +212,12 @@ def render_markdown(data, top_libraries=20, matrix_libraries=15):
                        "marker(s) detected.**\n")
         return "".join(out)
 
+    raw = data.get("raw_emissions", total)
+    factor = f" (~{raw // total}x)" if total else ""
     out.append(
-        f"**{total}** violations across **{data['files']}** files in "
-        f"**{data['libraries']}** libraries.  \n"
+        f"**{total}** distinct violation sites across **{data['files']}** files "
+        f"in **{data['libraries']}** libraries, deduplicated from **{raw}** raw "
+        f"emissions{factor}.  \n"
     )
     extra = []
     if data["crash_markers"]:
@@ -213,8 +229,8 @@ def render_markdown(data, top_libraries=20, matrix_libraries=15):
         out.append(" · ".join(extra) + "\n")
 
     # Rule distribution (mermaid pie).
-    out.append("\n### By rule kind\n\n")
-    out.append("```mermaid\npie showData title Violations by rule\n")
+    out.append("\n### By rule kind (distinct sites)\n\n")
+    out.append("```mermaid\npie showData title Distinct sites by rule\n")
     for rule, count in sorted(data["by_rule"].items(),
                               key=lambda kv: kv[1], reverse=True):
         out.append(f'  "{rule}" : {count}\n')
@@ -224,8 +240,8 @@ def render_markdown(data, top_libraries=20, matrix_libraries=15):
     libs = list(data["by_library"].items())[:top_libraries]
     if libs:
         maximum = libs[0][1]
-        out.append("\n### Top libraries\n\n")
-        out.append("| Library | Violations | |\n|---|--:|:--|\n")
+        out.append("\n### Top libraries (distinct sites)\n\n")
+        out.append("| Library | Sites | |\n|---|--:|:--|\n")
         for lib, count in libs:
             out.append(f"| `{lib}` | {count} | {_bar(count, maximum)} |\n")
 
@@ -310,12 +326,13 @@ const RULE_ORDER = __RULE_ORDER__;
 const esc = s => String(s);
 
 document.getElementById("sub").textContent =
-  `${D.total_violations} violations · ${D.files} files · ${D.libraries} libraries`;
+  `${D.total_violations} distinct sites · ${D.files} files · ${D.libraries} libraries`
+  + ` · deduped from ${D.raw_emissions} emissions`;
 
 const cards = [
-  ["Violations", D.total_violations], ["Files", D.files],
-  ["Libraries", D.libraries], ["Crash markers", D.crash_markers],
-  ["Non-profile errors", D.non_profile_errors],
+  ["Distinct sites", D.total_violations], ["Raw emissions", D.raw_emissions],
+  ["Files", D.files], ["Libraries", D.libraries],
+  ["Crash markers", D.crash_markers], ["Non-profile errors", D.non_profile_errors],
 ];
 document.getElementById("cards").innerHTML = cards.map(([l,n]) =>
   `<div class="card"><div class="n ${l==='Crash markers'&&n>0?'warn':''}">${n}</div>`
